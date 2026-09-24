@@ -27,6 +27,10 @@ rows are restored from namefix, which is what keeps the format byte exact.
 '''
 
 import array
+from collections import OrderedDict
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping, NamedTuple
 
 import numpy
 import zstd
@@ -163,15 +167,15 @@ class _Interner:
         return chunk.split(NEW_LINE)
 
 
-class _BlockEncoder:
-    '''Builds the columns of one encounter block.'''
 
-    def __init__(self, ms_base: int, global_start_row: int) -> None:
-        self.ms_base = ms_base
+class _BlockEncoder:
+    '''Builds the columns of one encounter block. Every row goes in via `add`.'''
+
+    def __init__(self, global_start_row: int) -> None:
         self.global_start_row = global_start_row
-        self.row_count = 0
-        # spine, packed to fixed width once the dictionary sizes are known
-        self.ts: list[int] = []
+        # spine, absolute ms; packed to fixed width once the dictionary sizes
+        # are known
+        self.ms: list[int] = []
         self.ev: list[int] = []
         self.sguid: list[int] = []
         self.tguid: list[int] = []
@@ -181,33 +185,42 @@ class _BlockEncoder:
         self.arity = bytearray()
         self.tail_cols: list[array.array] = []
         self.namefix = bytearray()
-        self._prev_ms = ms_base
 
-    def add_namefix(self, slot: int, name_index: int):
-        _uvarint(self.namefix, self.row_count)
-        self.namefix.append(slot)
-        _uvarint(self.namefix, name_index)
+    @property
+    def row_count(self):
+        return len(self.ms)
 
-    def add(self, ms: int, ev_i: int, sguid_i: int, tguid_i: int, spell_i: int):
-        # deltas: consecutive lines are ms apart, so the high bytes stay zero
-        # and zstd squashes the column. cumsum'd back into offsets on load.
-        self.ts.append(ms - self._prev_ms)
-        self._prev_ms = ms
+    @property
+    def ms_base(self):
+        return self.ms[0]
+
+    def add(
+        self, ms: int, ev_i: int, sguid_i: int, tguid_i: int, spell_i: int,
+        tail: list[int], namefix: list[tuple[int, int]],
+    ):
+        '''
+        Appends one row. `namefix` is (slot, name_index) for each guid whose
+        name differs from the one in the guid dict.
+        '''
+        row = self.row_count
+        for slot, name_index in namefix:
+            _uvarint(self.namefix, row)
+            self.namefix.append(slot)
+            _uvarint(self.namefix, name_index)
+
+        self.ms.append(ms)
         self.ev.append(ev_i)
         self.sguid.append(sguid_i)
         self.tguid.append(tguid_i)
         self.spell.append(spell_i)
-        self.row_count += 1
 
-    def add_tail(self, values: list[int]):
-        '''Stores one row's tail, padding every column to the same length.'''
-        self.arity.append(len(values))
-        while len(self.tail_cols) < len(values):
-            # a new slot back-fills zeros so every column stays row aligned
-            self.tail_cols.append(array.array("i", bytes(4 * (self.row_count - 1))))
-        for column, value in zip(self.tail_cols, values):
+        self.arity.append(len(tail))
+        while len(self.tail_cols) < len(tail):
+            # a new slot back-fills zeros for the rows before this one
+            self.tail_cols.append(array.array("i", bytes(4 * row)))
+        for column, value in zip(self.tail_cols, tail):
             column.append(value)
-        for column in self.tail_cols[len(values):]:
+        for column in self.tail_cols[len(tail):]:
             column.append(0)
 
     def tail_bounds(self):
@@ -220,8 +233,13 @@ class _BlockEncoder:
     def to_bytes(self, guid_width: int, spell_width: int, tail_widths: list[int]):
         guid_dtype = SPINE_WIDTHS[guid_width]
         spell_dtype = SPINE_WIDTHS[spell_width]
+        # deltas: consecutive lines are ms apart, so the high bytes stay zero
+        # and zstd squashes the column. cumsum'd back into offsets on load.
+        # a bugged line can step backwards; uint32 wraps and cumsum unwraps it
+        ms = numpy.array(self.ms, dtype=numpy.int64)
+        deltas = numpy.diff(ms, prepend=ms[:1]).astype(TS_DTYPE)
         spine = b"".join((
-            numpy.array(self.ts, dtype=TS_DTYPE).tobytes(),
+            deltas.tobytes(),
             numpy.array(self.ev, dtype=EV_DTYPE).tobytes(),
             numpy.array(self.sguid, dtype=guid_dtype).tobytes(),
             numpy.array(self.tguid, dtype=guid_dtype).tobytes(),
@@ -251,9 +269,9 @@ class Encoder:
     '''
     Accumulates normalized rows, then emits the LOGS_CUT.bin payload.
 
-    Rows must arrive in file order. `split_block()` closes the current block;
-    call it on every encounter boundary. With no calls the result is a single
-    block, which is valid and only gives up the partial read.
+    Rows must arrive in file order. Pass `new_block=True` on the first row of
+    every encounter; without it the result is a single block, which is valid
+    and only gives up the partial read.
     '''
 
     def __init__(self) -> None:
@@ -267,11 +285,6 @@ class Encoder:
         self.names = _Interner()
         self.blocks: list[_BlockEncoder] = []
         self.row_count = 0
-        self._block: _BlockEncoder = None
-
-    def split_block(self):
-        '''Close the current block so the next row starts a fresh one.'''
-        self._block = None
 
     def _guid(self, guid: bytes, name: bytes):
         '''Returns (guid_index, name_index or None when it matches the dict).'''
@@ -285,22 +298,21 @@ class Encoder:
             return known, None
         return known, name_i
 
-    def add_row(self, ms: int, fields: list[bytes]):
+    def add_row(self, ms: int, fields: list[bytes], new_block: bool=False):
         '''
         `fields` is a normalized row split on ',' with maxsplit=8: the 8 fixed
         fields plus the rest of the line as one blob.
         '''
-        block = self._block
-        if block is None:
-            block = self._block = _BlockEncoder(ms, self.row_count)
-            self.blocks.append(block)
+        if new_block or not self.blocks:
+            self.blocks.append(_BlockEncoder(self.row_count))
 
         sguid_i, sname_i = self._guid(fields[2], fields[3])
         tguid_i, tname_i = self._guid(fields[4], fields[5])
+        namefix = []
         if sname_i is not None:
-            block.add_namefix(SOURCE_SLOT, sname_i)
+            namefix.append((SOURCE_SLOT, sname_i))
         if tname_i is not None:
-            block.add_namefix(TARGET_SLOT, tname_i)
+            namefix.append((TARGET_SLOT, tname_i))
 
         tail = fields[8].split(COMMA) if len(fields) > 8 else []
 
@@ -316,9 +328,10 @@ class Encoder:
         if ev_i > 0xFF:
             raise ValueError(f"more than 256 distinct event types: {ev_i}")
 
-        block.add(ms, ev_i, sguid_i, tguid_i, spell_i)
-        block.add_tail([self._tail_value(value) for value in tail])
-
+        self.blocks[-1].add(
+            ms, ev_i, sguid_i, tguid_i, spell_i,
+            [self._tail_value(value) for value in tail], namefix,
+        )
         self.row_count += 1
 
     def _tail_value(self, value: bytes):
@@ -387,59 +400,147 @@ class Encoder:
         return bytes(head) + b"".join(payloads)
 
 
-class _Block:
-    '''One decoded encounter block. Every column is a numpy array.'''
-    __slots__ = (
-        "global_start_row", "ms_base", "byte_offset", "byte_len", "row_count",
-        "ts", "ev", "sguid", "tguid", "spell", "arity", "tail", "namefix",
-        "namefix_str", "namefix_bytes",
+class Dicts(NamedTuple):
+    '''
+    The report's dictionaries. The spine columns index into these, so a
+    consumer builds its lookup table over them once - hundreds of entries,
+    not hundreds of thousands. Still unpacks as the old 6-tuple.
+    '''
+    events: tuple
+    guids: tuple
+    # the name each guid has for most of the report; see Block.namefix
+    guid_names: tuple
+    # (spell_id, spell_name) per spell index; index 0 is NO_SPELL
+    spells: tuple
+    # tail literals: a negative tail value v means strings[-v - 1]
+    strings: tuple
+    # every name seen, the superset Block.namefix indexes into
+    names: tuple
+
+    def decode(self):
+        '''The same dictionaries as str.'''
+        return Dicts(
+            tuple(e.decode() for e in self.events),
+            tuple(g.decode() for g in self.guids),
+            tuple(n.decode() for n in self.guid_names),
+            tuple((i.decode(), n.decode()) for i, n in self.spells),
+            tuple(s.decode() for s in self.strings),
+            tuple(n.decode() for n in self.names),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BlockMeta:
+    '''One entry of the block table, known without decompressing anything.'''
+    index: int
+    global_start_row: int
+    ms_base: int
+    byte_offset: int
+    byte_len: int
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Block:
+    '''
+    One decoded encounter block. Built in one go by `_decode_block` and never
+    changed afterwards; every column is a read-only numpy array.
+    '''
+    meta: BlockMeta
+    row_count: int
+    # ms offsets from meta.ms_base
+    ts: numpy.ndarray
+    ev: numpy.ndarray
+    sguid: numpy.ndarray
+    tguid: numpy.ndarray
+    spell: numpy.ndarray
+    # how many tail slots each row really has; the rest are padding
+    arity: numpy.ndarray
+    # one signed column per slot, see Dicts.strings for negative values
+    tail: tuple
+    # row -> (source name index or None, target name index or None) into
+    # Dicts.names, for the rows whose names differ from Dicts.guid_names
+    namefix: Mapping
+
+    @property
+    def global_start_row(self):
+        return self.meta.global_start_row
+
+    @property
+    def ms_base(self):
+        return self.meta.ms_base
+
+
+def _decode_namefix(data: bytes):
+    '''The namefix varint stream -> Block.namefix.'''
+    overrides: dict[int, tuple] = {}
+    reader = _Reader(data)
+    while reader.pos < len(data):
+        row = reader.uvarint()
+        slot = reader.u8()
+        name_i = reader.uvarint()
+        source, target = overrides.get(row, (None, None))
+        if slot == SOURCE_SLOT:
+            source = name_i
+        else:
+            target = name_i
+        overrides[row] = (source, target)
+    return MappingProxyType(overrides)
+
+
+def _decode_block(meta: BlockMeta, raw: bytes, guid_dtype, spell_dtype, tail_widths):
+    reader = _Reader(raw)
+    rows = reader.uvarint()
+    namefix_len = reader.uvarint()
+
+    dtypes = [TS_DTYPE, EV_DTYPE, guid_dtype, guid_dtype, spell_dtype, numpy.uint8]
+    dtypes += [TAIL_DTYPES[width] for width in tail_widths]
+    columns = []
+    pos = reader.pos
+    for dtype in dtypes:
+        columns.append(numpy.frombuffer(raw, dtype=dtype, count=rows, offset=pos))
+        pos += numpy.dtype(dtype).itemsize * rows
+    ts_deltas, ev, sguid, tguid, spell, arity, *tail = columns
+
+    # stored as deltas; make it offsets from ms_base
+    ts = numpy.cumsum(ts_deltas, dtype=TS_DTYPE)
+    ts.flags.writeable = False
+
+    return Block(
+        meta=meta, row_count=rows,
+        ts=ts, ev=ev, sguid=sguid, tguid=tguid, spell=spell,
+        arity=arity, tail=tuple(tail),
+        namefix=_decode_namefix(raw[pos:pos + namefix_len]),
     )
 
-    def __init__(self, global_start_row, ms_base, byte_offset, byte_len) -> None:
-        self.global_start_row = global_start_row
-        self.ms_base = ms_base
-        self.byte_offset = byte_offset
-        self.byte_len = byte_len
-        self.row_count = None
-        self.namefix_str = None
-        self.namefix_bytes = None
 
-    def load(self, raw: bytes, guid_dtype, spell_dtype, tail_widths):
-        reader = _Reader(raw)
-        self.row_count = rows = reader.uvarint()
-        namefix_len = reader.uvarint()
+class _RenderedBlocks:
+    '''Small LRU of blocks rendered as text lines. A pure cache.'''
 
-        pos = reader.pos
-        for name, dtype in (
-            ("ts", TS_DTYPE), ("ev", EV_DTYPE),
-            ("sguid", guid_dtype), ("tguid", guid_dtype), ("spell", spell_dtype),
-        ):
-            column = numpy.frombuffer(raw, dtype=dtype, count=rows, offset=pos)
-            if name == "ts":
-                # stored as deltas; make it offsets from ms_base
-                column = numpy.cumsum(column, dtype=TS_DTYPE)
-            setattr(self, name, column)
-            pos += numpy.dtype(dtype).itemsize * rows
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._lines: OrderedDict[int, list[str]] = OrderedDict()
 
-        self.arity = numpy.frombuffer(raw, dtype=numpy.uint8, count=rows, offset=pos)
-        pos += rows
+    def get(self, index: int):
+        lines = self._lines.get(index)
+        if lines is not None:
+            self._lines.move_to_end(index)
+        return lines
 
-        self.tail = []
-        for width in tail_widths:
-            dtype = TAIL_DTYPES[width]
-            self.tail.append(
-                numpy.frombuffer(raw, dtype=dtype, count=rows, offset=pos)
-            )
-            pos += width * rows
-
-        self.namefix = raw[pos:pos + namefix_len]
-        return self
+    def put(self, index: int, lines: list[str]):
+        self._lines[index] = lines
+        while len(self._lines) > self.size:
+            self._lines.popitem(last=False)
 
 
 class ColumnStore:
     '''
-    Decoded LOGS_CUT.bin. Blocks decompress on first touch and stay cached, so
-    one encounter never materializes the rest of the report.
+    Decoded LOGS_CUT.bin. The header and dictionaries are read up front; a
+    block decompresses on first touch, so one encounter never materializes
+    the rest of the report.
+
+    Everything set in __init__ stays as it is. The only things that fill in
+    later are the two caches, `_decoded` and `_rendered`, and a cache hit
+    returns exactly what a miss would have built.
     '''
 
     def __init__(self, data: bytes) -> None:
@@ -454,37 +555,47 @@ class ColumnStore:
         self.guid_dtype = SPINE_WIDTHS[data[12]]
         self.spell_dtype = SPINE_WIDTHS[data[13]]
         tail_slots = data[14]
-        self.tail_widths = list(data[15:15 + tail_slots])
+        self.tail_widths = tuple(data[15:15 + tail_slots])
 
         reader = _Reader(data, 15 + tail_slots)
-        self.events = _Interner.from_reader(reader)
+        events = _Interner.from_reader(reader)
         # index 0 is the NO_SPELL sentinel; pad it to the (id, name, school) shape
         spell_entries = [
             entry.split(SPELL_SEP) if entry else [b"", b"", b""]
             for entry in _Interner.from_reader(reader)
         ]
-        # school is kept apart because it already lives in the tail
-        self.spells = [entry[:2] for entry in spell_entries]
-        self.spell_schools = [entry[2] for entry in spell_entries]
-        self.strings = _Interner.from_reader(reader)
+        strings = _Interner.from_reader(reader)
         guid_dict = [g.split(SPELL_SEP) for g in _Interner.from_reader(reader)]
-        self.guids = [g[0] for g in guid_dict]
-        self.guid_names = [g[1] for g in guid_dict]
-        self.names = _Interner.from_reader(reader)
+        names = _Interner.from_reader(reader)
+
+        # the dictionaries as stored, which byte_lines renders from
+        self.raw = Dicts(
+            events=tuple(events),
+            guids=tuple(g[0] for g in guid_dict),
+            guid_names=tuple(g[1] for g in guid_dict),
+            spells=tuple((entry[0], entry[1]) for entry in spell_entries),
+            strings=tuple(strings),
+            names=tuple(names),
+        )
+        # school is kept apart because it already lives in the tail
+        self.spell_schools = tuple(entry[2] for entry in spell_entries)
+        # the same as str, which every consumer and the text renderer use
+        self.text = self.raw.decode()
 
         table_len = int.from_bytes(data[reader.pos:reader.pos + 4], "little")
         reader.pos += 4
         table = _Reader(data, reader.pos)
-        self.blocks: list[_Block] = []
-        for _ in range(block_count):
-            self.blocks.append(_Block(
-                table.uvarint(), table.uvarint(), table.uvarint(), table.uvarint(),
-            ))
+        self.blocks = tuple(
+            BlockMeta(
+                index, table.uvarint(), table.uvarint(),
+                table.uvarint(), table.uvarint(),
+            )
+            for index in range(block_count)
+        )
         self._payloads = data[reader.pos + table_len:]
-        self._loaded: dict[int, _Block] = {}
-        self._str_dicts = None
-        self._lines: dict[int, list[str]] = {}
-        self._lines_order: list[int] = []
+
+        self._decoded: dict[int, Block] = {}
+        self._rendered = _RenderedBlocks(RENDERED_BLOCK_CACHE)
 
     def __len__(self):
         return self.row_count
@@ -503,50 +614,31 @@ class ColumnStore:
         return lo, row - blocks[lo].global_start_row
 
     def block(self, index: int):
-        '''Decompress one block, or hand back the already decoded one.'''
-        try:
-            return self._loaded[index]
-        except KeyError:
-            pass
-        block = self.blocks[index]
-        start = block.byte_offset
-        raw = zstd.decompress(self._payloads[start:start + block.byte_len])
-        self._loaded[index] = block.load(
-            raw, self.guid_dtype, self.spell_dtype, self.tail_widths
-        )
-        return block
-
-    def str_dicts(self):
-        """The dictionaries decoded to str, built once per report."""
-        if self._str_dicts is None:
-            self._str_dicts = (
-                [e.decode() for e in self.events],
-                [g.decode() for g in self.guids],
-                [n.decode() for n in self.guid_names],
-                [(i.decode(), n.decode()) for i, n in self.spells],
-                [s.decode() for s in self.strings],
-                [n.decode() for n in self.names],
+        '''The decoded Block at `index`, decompressed on first use.'''
+        block = self._decoded.get(index)
+        if block is None:
+            meta = self.blocks[index]
+            start = meta.byte_offset
+            raw = zstd.decompress(self._payloads[start:start + meta.byte_len])
+            block = _decode_block(
+                meta, raw, self.guid_dtype, self.spell_dtype, self.tail_widths
             )
-        return self._str_dicts
+            self._decoded[index] = block
+        return block
 
     def lines(self, index: int):
         """Rendered lines of one block, cached across views."""
-        cached = self._lines.get(index)
-        if cached is not None:
-            return cached
-
-        rendered = self._render(index)
-        self._lines[index] = rendered
-        self._lines_order.append(index)
-        while len(self._lines_order) > RENDERED_BLOCK_CACHE:
-            del self._lines[self._lines_order.pop(0)]
-        return rendered
+        lines = self._rendered.get(index)
+        if lines is None:
+            lines = self._render(index)
+            self._rendered.put(index, lines)
+        return lines
 
     def _render(self, index: int):
         """Builds the text lines of one block directly as str."""
         block = self.block(index)
-        events, guids, guid_names, spells, strings, names = self.str_dicts()
-        overrides = self._namefix(block, names)
+        events, guids, guid_names, spells, strings, names = self.text
+        namefix = block.namefix
 
         arity = block.arity.tolist()
         tail_cols = [column.tolist() for column in block.tail]
@@ -565,13 +657,13 @@ class ColumnStore:
             tguid_i = tguid_col[row]
             spell_i = spell_col[row]
 
-            fix = overrides.get(row)
+            fix = namefix.get(row)
             if fix is None:
                 sname = guid_names[sguid_i]
                 tname = guid_names[tguid_i]
             else:
-                sname = fix.get(SOURCE_SLOT) or guid_names[sguid_i]
-                tname = fix.get(TARGET_SLOT) or guid_names[tguid_i]
+                sname = guid_names[sguid_i] if fix[0] is None else names[fix[0]]
+                tname = guid_names[tguid_i] if fix[1] is None else names[fix[1]]
 
             fields = [
                 ms_to_timestamp_str(ms), events[ev_col[row]],
@@ -595,16 +687,14 @@ class ColumnStore:
         if stop is None:
             stop = self.row_count
         index, _ = self.block_of(start)
-        while index < len(self.blocks):
-            meta = self.blocks[index]
+        for meta in self.blocks[index:]:
             if meta.global_start_row >= stop:
                 return
-            block = self.block(index)
+            block = self.block(meta.index)
             lo = max(start - meta.global_start_row, 0)
             hi = min(stop - meta.global_start_row, block.row_count)
             if hi > lo:
                 yield block, lo, hi
-            index += 1
 
     # a timestamp has no dictionary behind it, so a needle of only these
     # characters can never be narrowed
@@ -620,20 +710,20 @@ class ColumnStore:
         if not needle or self._TIMESTAMP_CHARS.issuperset(needle):
             return None
 
-        events, guids, guid_names, spells, strings, names = self.str_dicts()
-        for dictionary in (guids, guid_names, strings, names):
+        text = self.text
+        for dictionary in (text.guids, text.guid_names, text.strings, text.names):
             if any(needle in value for value in dictionary):
                 return None
-        for spell_id, spell_name in spells:
+        for spell_id, spell_name in text.spells:
             if needle in spell_id or needle in spell_name:
                 return None
-        return numpy.array([needle in event for event in events], dtype=bool)
+        return numpy.array([needle in event for event in text.events], dtype=bool)
 
     def seconds(self):
         """Absolute seconds per row. Decompresses every block."""
         return numpy.concatenate([
-            (self.block(i).ts.astype(numpy.int64) + block.ms_base) // 1000
-            for i, block in enumerate(self.blocks)
+            (self.block(meta.index).ts.astype(numpy.int64) + meta.ms_base) // 1000
+            for meta in self.blocks
         ])
 
     def second_offsets(self):
@@ -649,13 +739,8 @@ class ColumnStore:
         ).tolist()
 
     def dicts(self):
-        """
-        (events, guids, guid_names, spells, strings, names) as str lists.
-
-        The spine columns index into these, so a consumer builds its lookup
-        table over these once - hundreds of entries, not hundreds of thousands.
-        """
-        return self.str_dicts()
+        """The dictionaries as str, see Dicts."""
+        return self.text
 
     def spell_entries(self):
         """
@@ -666,7 +751,7 @@ class ColumnStore:
         """
         return [
             (spell_id.decode(), name.decode(), school.decode())
-            for (spell_id, name), school in zip(self.spells, self.spell_schools)
+            for (spell_id, name), school in zip(self.raw.spells, self.spell_schools)
             if spell_id
         ]
 
@@ -676,23 +761,25 @@ class ColumnStore:
         otherwise reads the row straight out of the columns.
         """
         index, offset = self.block_of(row)
-        rendered = self._lines.get(index)
+        rendered = self._rendered.get(index)
         if rendered is not None:
             return rendered[offset]
 
         block = self.block(index)
-        events, guids, guid_names, spells, strings, names = self.str_dicts()
+        events, guids, guid_names, spells, strings, names = self.text
 
         sguid_i = int(block.sguid[offset])
         tguid_i = int(block.tguid[offset])
         spell_i = int(block.spell[offset])
 
-        fix = self._namefix(block, names).get(offset)
         sname = guid_names[sguid_i]
         tname = guid_names[tguid_i]
+        fix = block.namefix.get(offset)
         if fix is not None:
-            sname = fix.get(SOURCE_SLOT) or sname
-            tname = fix.get(TARGET_SLOT) or tname
+            if fix[0] is not None:
+                sname = names[fix[0]]
+            if fix[1] is not None:
+                tname = names[fix[1]]
 
         fields = [
             ms_to_timestamp_str(block.ms_base + int(block.ts[offset])),
@@ -709,13 +796,8 @@ class ColumnStore:
     def rows(self, index: int):
         '''Yields (ms, fixed_fields, tail_values) per row of one block, as bytes.'''
         block = self.block(index)
-        events = self.events
-        guids = self.guids
-        guid_names = self.guid_names
-        spells = self.spells
-        strings = self.strings
-
-        overrides = self._namefix(block)
+        events, guids, guid_names, spells, strings, names = self.raw
+        namefix = block.namefix
 
         arity = block.arity.tolist()
         tail_cols = [column.tolist() for column in block.tail]
@@ -732,13 +814,13 @@ class ColumnStore:
             tguid_i = tguid_col[row]
             spell_i = spell_col[row]
 
-            fix = overrides.get(row)
+            fix = namefix.get(row)
             if fix is None:
                 sname = guid_names[sguid_i]
                 tname = guid_names[tguid_i]
             else:
-                sname = fix.get(SOURCE_SLOT) or guid_names[sguid_i]
-                tname = fix.get(TARGET_SLOT) or guid_names[tguid_i]
+                sname = guid_names[sguid_i] if fix[0] is None else names[fix[0]]
+                tname = guid_names[tguid_i] if fix[1] is None else names[fix[1]]
 
             fixed = [
                 events[ev_col[row]],
@@ -756,38 +838,6 @@ class ColumnStore:
                 )
 
             yield ms, fixed, values
-
-    def _namefix(self, block: _Block, names=None):
-        """
-        Row -> {slot: name} for the few GUIDs that changed name mid report.
-
-        Cached, because `row_line` asks for it on every row and re-walking the
-        varint stream made one row cost as much as rendering the block.
-        """
-        if not block.namefix:
-            return {}
-
-        as_str = names is not None
-        cached = block.namefix_str if as_str else block.namefix_bytes
-        if cached is not None:
-            return cached
-
-        if not as_str:
-            names = self.names
-        overrides: dict[int, dict[int, bytes]] = {}
-        reader = _Reader(block.namefix)
-        end = len(block.namefix)
-        while reader.pos < end:
-            row = reader.uvarint()
-            slot = reader.u8()
-            name = names[reader.uvarint()]
-            overrides.setdefault(row, {})[slot] = name
-
-        if as_str:
-            block.namefix_str = overrides
-        else:
-            block.namefix_bytes = overrides
-        return overrides
 
 
 # The log has no year, so the stored integer is a self contained
@@ -985,9 +1035,7 @@ def encode(lines, block_starts=None):
         fields = line.split(COMMA, 8)
         if len(fields) < 6:
             continue
-        if row in boundaries:
-            encoder.split_block()
-        encoder.add_row(timestamp_to_ms(fields[0]), fields)
+        encoder.add_row(timestamp_to_ms(fields[0]), fields, row in boundaries)
         row += 1
     return encoder.to_bytes()
 
